@@ -1,0 +1,458 @@
+#!/usr/bin/env perl
+
+# =================================================================================== #
+#  10bees system monitoring agent
+#  Copyright 2011-2013
+#
+#  You may use it for the monitoring purposes of your computer with 10bees.com service.
+#  Code can't be redistributed, or used for any other purposes, unless
+#  written permission granted from the copyright owner.
+#
+#  http://10bees.com/support/
+# =================================================================================== #
+
+use warnings;
+use strict;
+
+use FindBin qw/ $Bin $Script /;
+use lib "$Bin/lib";
+
+use TenBees::Config;
+use TenBees::Logger;
+use TenBees::Daemon qw/ is_running /;
+use TenBees::Register qw/ register host_registered/;
+use TenBees::Utils qw/ daemonize set_gid_uid touch_file /;
+
+$| = 1;
+
+my $config = TenBees::Config->get();
+
+if(!$config->{LogFile}) {
+    $ENV{'LOG_STDERR'} = 1; #ensure that all messages are going to the stderr, by default
+}
+TenBees::Logger::initialize($config);
+
+my ($command, $cred_file) = (shift(@ARGV) || '', '');
+
+if (scalar @ARGV) {
+	require Getopt::Long;
+	Getopt::Long::GetOptions(
+	    "cred-file=s"	    => \$cred_file
+	);
+}
+
+if(!($command eq 'status' || $command eq 'version')) {
+  
+  #Darwin require root permissions for the agent to run
+  if (($^O eq 'darwin') || ($^O eq 'solaris')) {
+    die "MacOS X requires monitoring tool to run as root ($> detected) - please, run me via 'sudo'."
+      if ($> != 0);
+  
+  #For a regular *nix - drop root privileges
+  } else {
+    set_gid_uid(); 
+  }
+  
+  DEBUG "Verifying if config and PID files could be open for writing." if DEBUG_MODE;
+  
+  if(! -e $config->{ConfigFile}) {
+    DEBUG "Config file not found, creating empty one: " . $config->{ConfigFile} if DEBUG_MODE;
+    touch_file($config->{ConfigFile});
+  }
+  
+  die "PID file '".$config->{Pid}."' is not writable"
+      if (-e $config->{Pid} && !-w $config->{Pid});
+      
+}
+
+DEBUG "Agent's init done." if DEBUG_MODE;
+
+if ($command eq 'register') {
+    do_register($cred_file);
+    
+} elsif ($command eq 'start') {
+    do_start();
+    
+} elsif ($command eq 'stop') {
+    do_stop();
+    
+} elsif ($command eq 'restart') {
+    do_restart();
+    
+} elsif ($command eq 'status') {
+    exit(do_check_status());
+    
+} elsif ($command eq 'cleanup') {
+    do_cleanup();
+    
+} elsif ($command eq 'check_registration') {
+    do_check_registration();
+
+} elsif ($command eq 'version') {
+    do_print_version();
+    
+} elsif ($command eq 'show-collected-data') {
+    do_print_sys_info();
+    
+} else {
+    print join "\n",
+	"usage: $0 (register|start|stop|restart|status|cleanup|version|show-collected-data)",
+	'',
+	'register             - register agent',
+	'start                - start agent',
+	'stop                 - stop agent',
+	'restart              - restart agent',
+	'status               - check agent status',
+	'cleanup              - clean up disk queue',
+	'version              - show version',
+	'show-collected-data  - display collected system information',
+	'';
+}
+
+exit 0;
+
+
+sub do_check_status {
+    
+    my $config = TenBees::Config->get();
+    my $pidfile = $config->{Pid};
+
+    my $pid = undef;
+    
+    if($pid = TenBees::Daemon::is_running()) {
+        INFO "Found agent running (pid: $pid).";
+        exit 0;
+    }
+
+    INFO "The agent is not running [$pid].";
+    
+    WARN "Unexpected exit code ($pid) from checking agent status"
+        if !defined $pid;
+
+    if(-e $pidfile) {
+        INFO "Agent got stuck or killed - consider removing invalid PID file: $pidfile";
+    }
+
+    exit 1;
+}
+
+
+sub do_register {
+    
+    my $cred_file = shift;
+    my $config = TenBees::Config->get();
+    
+    if(exists($ENV{TENBEES_JUST_BUILD_NO_REGISTER}) && $ENV{TENBEES_JUST_BUILD_NO_REGISTER} eq '1') {
+        exit 0; #special stub for package building under *BSD platforms
+        
+    } else {
+      
+        DEBUG 'Agent registration requested - calling appropriate functions now.' if DEBUG_MODE;
+        if (host_registered()) {
+            INFO "Host is already registered, ready to start.";
+            exit 0;
+        }
+      
+        my $regResult = register($cred_file);
+      
+        if (1 == $regResult) {
+            exit 0; #success
+            
+        } elsif(0 == $regResult) {
+            exit 1; #error
+            
+	} elsif (255 == $regResult) {
+	    INFO "Registration requested for the already registered agent, skipping...";
+	    exit 0;
+            
+        } else {
+            ERROR "Unexpected result of registration procedure: $regResult";
+            ERROR "Please restart in debug mode and verify";
+            exit -1;
+        }
+    }
+}
+
+
+sub do_start {
+
+    DEBUG "Agent's start requested - calling appropriate functions." if DEBUG_MODE;
+    
+    my $config = TenBees::Config->get();
+    
+    if (!host_registered()) {
+        
+        INFO "Agent is not registered - please run:";
+        
+        my $os = lc($^O);
+    
+        if ($os eq 'linux') {
+            INFO "service 10bees-agent register";
+            
+        } elsif ($os eq 'freebsd') {
+            INFO "service tenbees register";
+    
+        } elsif (($os eq 'netbsd') || ($os eq 'openbsd')) {
+            INFO "/etc/rc.d/tenbees register";
+            
+        } elsif ($os eq 'darwin') {
+            INFO "$Bin/$Script register";
+
+        } elsif ($os eq 'solaris') {
+            INFO "/lib/svc/method/tenbees-agent register";  
+            
+        } else {
+            INFO "$Bin/$Script start";
+        }
+        
+        exit 0;
+    }
+    
+    my $pid = TenBees::Daemon->is_running();
+    
+    if ($pid) {
+        print "Agent is already running (pid is $pid).\n";
+        return 1;
+    }
+    
+    #PID file exists, but agent is not running - shutting down.
+    #That is required to avoid two agents running at the same time.
+    if (-e $config->{Pid}) {
+        DEBUG "PID file found, while agent doesn't seem to be running - about to die." if DEBUG_MODE;
+      
+        my $pid_file_found_message = "'$config->{Pid}' PID file found, while agent doesn't seem to be running.";
+        $pid_file_found_message .= " Please, verify agent status (`ps aux | grep 10bees`) and remove file manually if required.";
+      
+        print $pid_file_found_message."\n";
+        exit 1;
+    }
+  
+    #Unix way is to keep silence, if you are successfull.
+    #INFO "Starting the agent...\n";
+  
+    daemonize();
+    
+    if (TenBees::Daemon->start()) {
+      
+        my ($pid, $wait_for_seconds, $counter) = (0, 60, 0);
+        
+        #Give it up to one minute for the agent to start
+        for ($counter=0; ($counter < $wait_for_seconds); $counter++) {
+            
+            sleep 1;
+            
+            if ($pid = TenBees::Daemon->is_running()) {
+                INFO "Agent v. $config->{Version} started successfully, PID=$pid.\n";
+                last;
+            }
+            
+        }
+        
+        if (!$pid) {
+            ERROR "Agent start attempted $counter times, but failed ($pid).\n";
+            return 1;
+            
+        } else {
+            DEBUG "Agent assumed to be started successfully, got a PID=$pid, waited for ~$counter seconds." if DEBUG_MODE;
+        }
+        
+    } else {
+        
+        ERROR "Failed to start agent - please check logs for details.\n";
+        return 1;
+    }
+    
+    exit 0;
+}
+
+
+sub do_stop {
+
+    DEBUG "Agent's stop requested - calling appropriate functions now." if DEBUG_MODE;
+    
+    my $config = TenBees::Config->get();
+    
+    if (!TenBees::Daemon->is_running()) {
+        print "Can't stop agent, which is not running.\n";
+        #unlink $pidfile or WARN "Can't remove $pidfile: $!"; #TODO: remove PID file here.
+        exit 0;
+    }
+    
+    if(TenBees::Daemon->stop()) {
+      
+        sleep 5;
+      
+        if( my $pid = TenBees::Daemon->is_running() ) {
+            print "Agent (pid: $pid) didn't stop on time - please check logs for details.\n";
+            return 0;
+        
+        } else {
+            #print "10bees monitoring agent stopped.\n"; #silent success (printed on the console)
+            return 1;
+        }
+        
+    } else {
+        print "Failed to stop agent - please check logs for details.\n";
+        return 0;
+    }
+    
+    return 0;
+}
+
+
+sub do_restart {
+    DEBUG "Agent's restart requested." if DEBUG_MODE;
+    do_stop() && print "Restarting the agent...\n" && do_start();
+}
+
+
+sub do_cleanup {
+    DEBUG "Agent's disk queue cleanup requested - calling appropriate functions now." if DEBUG_MODE;
+    
+    TenBees::DiskQueue->cleanup(); # will die on error
+    
+    INFO "Disk queue cleanup completed successfully.";
+    
+    exit 0;
+}
+
+# NOTE: do not declare this function in help message
+# it is for internal use only
+sub do_check_registration {
+    DEBUG "Agent's check for registration requested - calling appropriate functions now." if DEBUG_MODE;
+    
+    my $config = TenBees::Config->get();
+    my $res = !host_registered();
+    if($res) {
+        INFO "Agent is not registered";
+    } else {
+        INFO "Agent is already registered";
+    }
+    exit $res;
+}
+
+sub do_print_version {
+    DEBUG "Agent's version requested - calling appropriate functions now." if DEBUG_MODE;
+
+    my $config = TenBees::Config->get();
+    die "Agent version not defined in config" if(!defined $config->{Version});
+
+    print '10bees.com monitoring agent, version ' . $config->{Version} . "\n";
+}
+
+sub do_print_sys_info {
+    
+    if (!host_registered()) {
+        INFO "Agent is not registered";
+        return;
+    }  
+    
+    # Following structure contains in keys the block names 
+    # returned by Unpacker and their field names in values.
+    # Moreover, values serves as a template to print - after
+    # extracting fields, these values converts to 
+    # 'sprintf' formatting string.
+    my @blocks = (
+        { 'Host info'		=> "host_address host_name 
+                                    os_name os_arch os_release
+                                    uptime timestamp",
+        },
+        { 'Memory'	        => "total used free cached 
+                                    swap_total swap_used buffers
+                                    active inactive wired",
+        },
+        { 'CPU'			=> "idle nice irq sintr steal wait 
+                                    system user guest", 
+        } ,
+        { 'Processes'		=> "running sleeping stopped
+                                    zombies stuck
+                                    total",
+        },
+        { 'CPU devours'		=> "cmdline
+                                    cpu_usage mem_usage uid pid ppid username",
+        },
+        { 'Memory devours'	=> "cmdline
+                                    cpu_usage mem_usage uid pid ppid username",
+        },
+        { 'Mounts'		=> "filesystem mounted_on
+                                    total free",
+        },
+        { 'Network interfaces'	=> "name
+                                    ipv4_addrs ipv6_addrs
+                                    sent recv",
+        },
+    );
+    
+    my $max_length = sub {
+            my ($max)  = sort {length $b <=> length $a} @_;
+            return length $max;
+    };
+    
+    my $width = $max_length->(map {keys %$_} @blocks);
+
+    my $format = sub {
+        
+        my ( $struct, $mask ) = @_;
+        my @fields = split(/\s+/, $mask);
+        # create mask:
+        # remove extra blanks
+        $mask =~ s/[[:blank:]]+/ /gs;
+        # insert indent
+        $mask =~ s/^\s*/' ' x $width/egms;
+        # replace names by sprintf mask keywords
+        $mask =~ s/\S+/\%s = '\%s',/gs;
+        # endline semicolon
+        $mask =~ s/,\s*$/;/gms;
+
+        my @values;
+        # collect keys/values in appropriate order
+        for my $name (@fields) {
+                my $value = (defined $struct->{$name}) ? $struct->{$name} : 'unknown';
+                if ( ref $value eq 'ARRAY' ) {
+                        # collapse list
+                        $value = '[ '.join( ', ', @$value ).' ]';
+                }
+                push @values, ($name, $value);
+        }
+        # format output string
+        return sprintf($mask, @values);
+        
+    };
+    
+    my $output = q();
+    
+    require TenBees::ProcSysInfo;
+
+    TenBees::ProcSysInfo::get_sysinfo(\$output);
+    
+    local $Data::Dumper::Terse = 1;
+    my $unpacker = Data::MessagePack::Unpacker->new();
+    my $limit    = length $output;
+    my $offset   = 0;
+    INFO "Starting to dump system information collected:";
+
+    while ($offset < $limit) {
+        
+        $offset  = $unpacker->execute($output, $offset);
+        my $data = $unpacker->data();
+        my $block = shift @blocks;
+        my ($name) = keys %$block;
+        
+        INFO sprintf("%-${width}s:", $name);
+
+        if (ref $data eq 'ARRAY') {
+            my $i = 0;
+            map { 
+                INFO sprintf("%+${width}s.", ++$i);
+                INFO $format->($_, $block->{$name});
+            } @$data;
+            
+        } else {
+            INFO $format->($data, $block->{$name}); 
+        }
+
+	INFO ';';    
+        $unpacker->reset();
+
+    }
+}
