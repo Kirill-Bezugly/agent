@@ -1,4 +1,4 @@
-agent
+10bees monitoring agent
 =====
 
-10bees monitoring agent
+Monitoring agent for the 10bees.com service.
