@@ -228,7 +228,7 @@ sub send2collector {
     
     if ($@) {
         CRITICAL "Can't resolve the DNS name / create a URL to use: ".$@;
-        return ['Critical error at Delivery.pm'];
+        return undef;
     }
 
     my $request_uri = build_action_uri($action, $opts, $checksum);
