@@ -81,7 +81,7 @@ sub deliver_or_save_to_cache {
 
     DEBUG "Trying to send $nrecords message(s)" if DEBUG_MODE;
 
-    my $delivery_code = send_records(\@records, $nrecords);
+    my ($delivery_code, $response) = send_records(\@records, $nrecords);
     
     if($delivery_code == 200) {
 
@@ -107,7 +107,7 @@ sub deliver_or_save_to_cache {
     
     } elsif($delivery_code == 404) {
 
-        DEBUG "Deliver code: $delivery_code, failed to deliver $nrecords message(s). Trying to save the last one to the disk queue" if DEBUG_MODE;
+        DEBUG "Delivery code: $delivery_code, failed to deliver $nrecords message(s). Trying to save the last one to the disk queue" if DEBUG_MODE;
 
         eval {
             TenBees::DiskQueue->save_record($new_record);
@@ -123,7 +123,7 @@ sub deliver_or_save_to_cache {
     } else {
 
         $delivery_code = '<empty>' if (!defined($delivery_code));
-        WARN "Unknown delivery code: $delivery_code.";
+        WARN "Failed to send the data: unknown delivery code: $delivery_code, response: $response";
         
     }
 
@@ -195,22 +195,22 @@ sub send_records {
 
     DEBUG "Server response: $response->[0]" if DEBUG_MODE;
 
-    my $server_responce_code = undef;
+    my $server_response_code = "-1";
     
-    if ($response->[0]) {    
-        ($server_responce_code) = $response->[0] =~ m|^HTTP/1.1 (\d+).*|;
-        DEBUG "Have got the server reply $server_responce_code." if DEBUG_MODE;
+    if ($response->[0] =~ m|^HTTP/1.1 (\d+).*|) {    
+        $server_response_code = $1;
+        DEBUG "Got the server reply $server_response_code." if DEBUG_MODE;
         
-    } elsif (!defined($response->[0])) {
+    } elsif ($response->[0]) {
+	DEBUG "Unrecognised server response." if DEBUG_MODE ;
+    
+    }
+    else {
         $response->[0] = '';
         DEBUG "Server reply is blank." if DEBUG_MODE;
     }
-
-    if ($server_responce_code != 200) {
-        WARN "Failed to send statistics data - server code=$server_responce_code, server responce: $response->[0]";
-    }
     
-    return $server_responce_code;
+    return $server_response_code, $response->[0];
 }
 
 

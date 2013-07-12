@@ -41,10 +41,10 @@ my $dispatcher_data_msgpack = Data::MessagePack->pack(undef);
 
 my $msgpack = $agent_data_msgpack.$sysinfo.$dispatcher_data_msgpack;
 
-my $sendResult;
+my ($sendResult, $sendResponse);
 SKIP: {
     skip "Feature doesn't work correctly for win32", 1 if $^O eq 'MSWin32'; #TODO: Why?
-    $sendResult = TenBees::Agent::send_records([$msgpack], 1);
+    ($sendResult, $sendResponse) = TenBees::Agent::send_records([$msgpack], 1);
     ok(($sendResult == 200), "send_records(valid data)");
 }
 
@@ -52,13 +52,13 @@ SKIP: {
 # Verify if collector will reject corrupted MsgPack data
 #
 $msgpack = substr $msgpack, 0, length($msgpack)/2;
-$sendResult = TenBees::Agent::send_records([$msgpack], 1);
+($sendResult, $sendResponse) = TenBees::Agent::send_records([$msgpack], 1);
 ok(($sendResult == 400), "send_records(bad data) - got server reply = $sendResult");
 
 #
 # Verify if collector will reject non binary data at all
 #
 my $string = "Hello, I am just a test string, nothing special";
-$sendResult = TenBees::Agent::send_records([$string], 1);
+($sendResult, $sendResponse) = TenBees::Agent::send_records([$string], 1);
 ok(($sendResult == 400), "send_records(plain string) - got server reply = $sendResult");
 
